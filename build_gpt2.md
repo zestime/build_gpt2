@@ -78,19 +78,59 @@ He mentioned mlp and attn in block
 
 ## Tensor Cores, timing the code, TF32 precision, 333ms
 
+I set the set_float32_matmul_precision('high'). They have 3 values.
+- highest :
+- high :
+- medium :
+
 ## float16, gradient scalers, bfloat16, 300ms
+
+- Automatic Mixed Precision (AMP) - torch.cuda.amp provide mixed precision, where float16 is used for matmul and bfloat16 is used for gradient scalers. This uses `torch.autocast`. This should cover forward pass and logit calculation, except backward pass.
+- autocast can convert float32 to float16, such as matmul, but it does not convert float16 to float32. 
 
 ## torch.compile, Python overhead, kernel fusion, 130ms
 
+- compile : seepup mainly comes from reducing python overhead and GPU read/writes, and so the observed speedup may vary on factors such as model architecture and batch size.
+- optimize process, read all layers at the begining. But without compilation, it doesn't know what layers next.
+
+
 ## flash attention, 96ms
+
+2022 paper : Flash Attention: Fast and Memory-Efficient Attention with Kernel Fusion and Asynchronous Computation
+
+Kernel fusion operation - single fused kernel
+faster 7.6x 
+avoid HBM
+Flash Attention doesn't read and write the large matrix N x N
+online softmax manner
+
+Flash Attention 2 - online normalizer calcuation for softmax
+- few memory accesses and hyphothesis
 
 ## nice/ugly numbers. vocab size 50257 → 50304, 93ms
 
+extend vocab size to 50304 following power of 2. It is not that important, but it is common practice. I'm not sure it is faster than before. In the toy set, it improved from 92ms to 88ms.
+
 # SECTION 3: hyperpamaters, AdamW, gradient clipping
+
+GPT3 paper
+Language Models are Unsupervised Multitask Learners
+Hyper parameters at details of model training
+roughly GPT-2 and GPT-3 are similar
+- AdamW : beta and eps
+- clip global norm : bigger shock, hacky solution
 
 ## learning rate scheduler: warmup + cosine decay
 
+learning rate needs to be scheduled. at the first start a little higher as warm up, then it follow cosign decay.
+
 ## batch size schedule, weight decay, FusedAdamW, 90ms
+
+graudual batch size
+understand weight decay
+Weight decay is a regularization hyperparameter that dictates how strongly the model's weights are penalized simply for being large. On the other hand, The learning rate is an optimization hyperparameter that dictates how big of a step the optimizer takes in the direction of the loss function's negative gradient (i.e., downhill).
+
+
 
 ## gradient accumulation
 

@@ -1,3 +1,5 @@
+import inspect
+import time
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -37,14 +39,23 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, T, nh, hs) -> (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
         # attention (materializes the large (T,T) matrix for all the quries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, hs) @ (B, nh, hs, T) -> (B, nh, T, T)
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, hs) @ (B, nh, hs, T) -> (B, nh, T, T)
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # (B, T, C)
         y = self.c_proj(y) 
         return y
+
+class TanhGELU(nn.Module):
+    # GPU and HBM, when calculation happen, load and store operation keep happen
+    # torch compile can reduce this kind of operation into single operation, round trips into one trip
+    def forward(self, input):
+        return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2 / math.pi) * (input + 0.044715 * torch.pow(input, 3))))
 
 class MLP(nn.Module):
 
@@ -85,7 +96,7 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     bias: bool = False
-    device: str = "mps"
+    device: str = "cuda"
 
 
 class GPT(nn.Module):
@@ -115,6 +126,30 @@ class GPT(nn.Module):
             module.weight.data.normal_(mean=0.0, std=std)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 module.bias.data.zero_()
+
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candiate parameters 
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        # create optim groups, Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embedding decay, all biases and layernorms don't
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        no_decay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_no_decay_params = sum(p.numel() for p in no_decay_params)
+        print(f"num decay params: {len(decay_params)}, {num_decay_params} params")
+        print(f"num no decay params: {len(no_decay_params)}, {num_no_decay_params} params")
+        # Create AdamW optimizer and use the fused version if available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
+        return optimizer
 
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
@@ -208,14 +243,14 @@ class DataLoaderLite:
         self.tokens_per_batch = self.batch_size * self.block_size
         self.current_idx = 0
         print(f"> loaded : {len(self.tokens)} tokens")
-        print(f"> 1 epoch : {self.tokens_per_batch} ")
+        print(f"> 1 epoch : {len(self.tokens) // self.tokens_per_batch} batches")
         
     def next_batch(self):
         base = self.tokens[self.current_idx : self.current_idx + self.tokens_per_batch + 1]
         x = base[:-1].view(self.batch_size, self.block_size)
         y = base[1:].view(self.batch_size, self.block_size)
         self.current_idx += self.tokens_per_batch
-        if (self.current_idx + 1 >= len(self.tokens)):
+        if (self.current_idx + self.tokens_per_batch + 1 >= len(self.tokens)):
             self.current_idx = 0
         return x, y
 
@@ -223,32 +258,68 @@ class DataLoaderLite:
 
 num_return_sequences = 5
 max_length = 30
-
-device = torch.accelerator.current_accelerator()
+stepp
+device = str(torch.accelerator.current_accelerator())
 print(f"> accelerator device: {device}")
 
 # data batch
-dl = DataLoaderLite(batch_size=8, block_size=256)
+dl = DataLoaderLite(batch_size=16, block_size=1024)
 
-# get logits
+torch.set_float32_matmul_precision('high')
+'''
+ - “highest”, float32 matrix multiplications use the float32 datatype (24 mantissa bits with 23 bits explicitly stored) for internal computations.
+ - “high”, float32 matrix multiplications either use the TensorFloat32 datatype (10 mantissa bits explicitly stored) or treat each float32 number as the sum of two bfloat16 numbers (approximately 16 mantissa bits with 14 bits explicitly stored), if the appropriate fast matrix multiplication algorithms are available. Otherwise float32 matrix multiplications are computed as if the precision is “highest”. See below for more information on the bfloat16 approach.
+ - “medium”, float32 matrix multiplications use the bfloat16 datatype (8 mantissa bits with 7 bits explicitly stored) for internal computations, if a fast matrix multiplication algorithm using that datatype internally is available. Otherwise float32 matrix multiplications are computed as if the precision is “high”.
+'''
+
+# get logitsstepp
 #model = GPT.from_pretrained('gpt2')
-config = GPTConfig()
-config.device = device
+# model = GPT(GPTConfig(vocab_size=50304))
 model = GPT(GPTConfig())
 model.to(device)
+model = torch.compile(model)
 
-# optimizer
-optimzer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_iters = 10
+max_steps = 50
+
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_iters:
+       return max_lr * (it+1) / warmup_iters
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_iters) / (max_steps - warmup_iters)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+    
+
+# opsteppimizer
+optimzer = modestepp.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
 
 # train
-for i in range(50):
+for step in range(max_steps):
+    t0 = time.time()
     optimzer.zero_grad()
     x, y = dl.next_batch()
-    logits, loss = model(x, y)
-    import code; code.interact(local=locals())
+    with torch.autocast(device_type=device):
+        logits, loss = model(x, y)
+        # import code; code.interact(local=locals())
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(step)
+    for param_group in optimzer.param_groups:
+        param_group['lr'] = lr
     optimzer.step()
-    print(f"> step:{i}, loss: {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # time diff in ms
+    tokens_per_sec = dl.tokens_per_batch / dt * 1000
+    print(f"step:{step:4d}| loss: {loss.item():.6f}| norm: {norm:.6f}| lr: {lr:.6f}| dt: {dt:.2f}ms| tokens per sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
