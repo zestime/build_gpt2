@@ -8,7 +8,7 @@ from torch.nn import functional as F
 import math
 import tiktoken
 from transformers import set_seed
-import numpy
+import numpy as np
 
 # ------------------------------------------
 
@@ -234,8 +234,6 @@ class GPT(nn.Module):
         return model
 
 # ------------------------------------
-import tiktoken
-import numpy as np
 
 def load_tokens(filename):
     npt = np.load(filename)
@@ -351,8 +349,8 @@ raw_model = model.module if ddp else model # always contain the unwrapped model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_iters = 100 # warm up 375e6 tokens, 375e6 / 0.5B(one epoch) = 715
-max_steps = 200000 # if train 10e9, 10e9 / 2**19(one epoch) = 200000
+warmup_iters = 20 # warm up 375e6 tokens, 375e6 / 0.5B(one epoch) = 715
+max_steps = 1000 # if train 10e9, 10e9 / 2**19(one epoch) = 200000
 
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -373,11 +371,20 @@ val_loader = DataLoaderLite(B, T, ddp_rank, ddp_world_size, 'val')
 # optimizer
 optimzer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device)
 
+# create the log directory we will write checkpoints to and log to
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "log.txt")
+with open(log_file, "w") as f: # open for writing to clear the file
+    pass
+
 # train
 for step in range(max_steps):
     t0 = time.time()
+    last_step = step == max_steps - 1
 
-    if step % 20 == 0:
+    # once in a while evaluate our validation loss
+    if step % 250 == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -390,7 +397,23 @@ for step in range(max_steps):
                     logits, loss = model(x, y)
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
-            print(f"val_loss: {val_loss_accum.item():.4f}")
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"validation loss: {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 5000 == 0 or last_step):
+                # optionally write model checkpoints
+                checkpoint_path = os.path.join(log_dir, f"checkpoint_{step:05d}.pt")
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item(),
+                }
+                # TODO - it should be improved to resume training
+                torch.save(checkpoint, checkpoint_path)
 
     # train
     model.train()
@@ -423,35 +446,3 @@ for step in range(max_steps):
 
 if ddp:
     destroy_process_group()
-
-import sys; sys.exit(0)
-
-num_return_sequences = 5
-max_length = 30
-print(f"> accelerator device: {device}")
-
-tokens = enc.encode("Hello, I'm a language model, ")
-tokens = torch.tensor(tokens, dtype=torch.long).unsqueeze(0)
-tokens = tokens.repeat(num_return_sequences, 1)
-x = tokens.to(device)
-
-set_seed(42)
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits = model(x) # (B, T, vocab_size)
-        logits = logits[:, -1, :] # take last position (B, vocab_size)
-        # get the probability of the next token
-        probs = F.softmax(logits, dim=-1)
-        # do top-k sampling of 50 (huggingface pipeline default)
-        # topk_probs here becomes (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)
-        # select top-k probabilities
-        ix = torch.multinomial(topk_probs, num_samples=1)
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, dim=-1, index=ix)
-        # append to the sequence
-        x = torch.cat([x, xcol], dim=1)
-
-for i in range(num_return_sequences):
-    tokens = x[i,:].tolist()
-    print(f"> {enc.decode(tokens)}")
