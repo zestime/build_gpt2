@@ -134,9 +134,19 @@ Weight decay is a regularization hyperparameter that dictates how strongly the m
 
 ## gradient accumulation
 
+- detach()
+- backward()
+
 ## distributed data parallel (DDP)
 
+- DDP - need to run parallel environment
+
 ## datasets used in GPT-2, GPT-3, FineWeb (EDU)
+
+- Common Crawl : need to filter, total mass of data is too big
+- SimPajama 
+- FineWeb data : high quality 44T , subset fine-web 1.5T
+  - fineweb edu : sample-10BT
 
 ## validation data split, validation loss, sampling revive
 

@@ -21,7 +21,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = True
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -65,6 +65,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -119,14 +120,16 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
+        if isinstance(module, nn.Linear):
             std = 0.02
             if hasattr(module, "NANOGPT_SCALE_INIT"):
                 std *= (2 * self.config.n_layer) ** -0.5
                 # 2 times comes from 'mlp' and 'attention' in block layer
-            module.weight.data.normal_(mean=0.0, std=std)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def configure_optimizers(self, weight_decay, learning_rate, device):
         # start with all of the candiate parameters 
@@ -258,7 +261,6 @@ class DataLoaderLite:
         assert len(shards) > 0, f"no shards found for split {split}"
         if master_process:
             print(f"> found {len(shards):,} shards for split {split}")
-
         self.reset()
 
     def reset(self):
@@ -268,11 +270,12 @@ class DataLoaderLite:
         
     def next_batch(self):
         B, T, pos = self.B, self.T, self.current_position
-        base = self.tokens[pos: pos + B * T + 1]
-        x = base[:-1].view(B, T)
-        y = base[1:].view(B, T)
+        buf = self.tokens[pos: pos + B * T + 1]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
         self.current_position += B * T * self.num_processes
-        if (self.current_position + B * T + 1 > len(self.tokens)):
+        #if (self.current_position + B * T + 1 > len(self.tokens)):
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = self.process_rank * B * T
@@ -422,13 +425,15 @@ for step in range(max_steps):
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device):
+
+        if ddp:
+            model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
             # import code; code.interact(local=locals())
         loss = loss / grad_accum_steps # loss function reduced by mean as default
         loss_accum += loss.detach()
-        if ddp:
-            model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
         loss.backward()
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
