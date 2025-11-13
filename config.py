@@ -77,6 +77,7 @@ class PicoGPTConfig:
     vocab_size: int = 50304  # 50,000 BPE merges + 256 bytes tokens + 1
     n_layer: int = 12  # number of layers
     n_head: int = 12
+    n_kv_head: int = 2 # number of key-value heads
     n_embd: int = 768
     bias: bool = False
 

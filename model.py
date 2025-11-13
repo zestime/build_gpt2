@@ -12,27 +12,34 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config: PicoGPTConfig):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = te.Linear(config.n_embd, 3 * config.n_embd)
+        assert config.n_head % config.n_kv_head == 0
+
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.n_kv_head = config.n_kv_head
+        self.head_size = config.n_embd // config.n_head
+        self.n_kv_embd = config.n_kv_head * self.head_size
+
+        # query + key + value projections for all heads, but in a batch
+        total_projection_dim = self.n_embd + self.n_kv_embd * 2
+        self.c_attn = te.Linear(config.n_embd, total_projection_dim)
         # output projection
         self.c_proj = te.Linear(config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
-        # regularization
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
+
 
                             
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embdding dimensionality (n_embd)
-        # nh: number of heads, hs: head size (n_embd // n_head), C(number of channels) = nh * hs
-        # e.g. in GPT-2 (124M), n_head=12, hs=64, so C=768 channels
-        qkv = self.c_attn(x) # (B, T, 3 * C)
-        q, k, v = qkv.split(C, dim=2) # each is (B, T, C)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, T, nh, hs) -> (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        qkv = self.c_attn(x) # (B, T, total_projection_dim)
+
+        q, k, v = qkv.split([C, self.n_kv_embd, self.n_kv_embd], dim=2) # each is (B, T, differ)
+        k = k.view(B, T, self.n_kv_head, self.head_size).transpose(1, 2)  # (B, T, nh, hs) -> (B, nh, T, hs)
+        v = v.view(B, T, self.n_kv_head, self.head_size).transpose(1, 2)
+        q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True) # (B, nh, T, hs)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # (B, T, C)
         y = self.c_proj(y) 

@@ -7,8 +7,6 @@ from model import load_model
 import torch
 import torch.distributed as dist
 import math
-from utils import create_timer
-# from preset import GPT2Preset, GPT2XLConfig
 
 def get_logger():
     logging.basicConfig(
@@ -101,7 +99,7 @@ def train(
         )
         tokens_per_sec = tokens_processed / dt
         if train_config.ddp_master:
-            print(
+            log.info(
                 f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt * 1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
             )
 
