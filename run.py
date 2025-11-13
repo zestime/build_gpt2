@@ -60,24 +60,19 @@ def train(
     dataloader,
     train_config:TrainConfig
 ):
-    timer = create_timer(True)
     for step in range(train_config.max_steps):
-        timer('start')
         t0 = time.time()
         last_step = step == train_config.max_steps - 1
 
         model.train()
         optimizer.zero_grad()
         loss_accum = 0.0
-        timer(f'micro start - {train_config.grad_accum_steps}')
         for micro_step in range(train_config.grad_accum_steps):
-            timer('next batch')
             x, y = dataloader.next_batch()
             x, y = x.to(train_config.device), y.to(train_config.device)
             # added after video, this field is also used by the forward pass.
             if train_config.ddp:
                 model.require_backward_grad_sync = micro_step == train_config.grad_accum_steps - 1
-            timer('forward')
             with torch.autocast(device_type=train_config.device, dtype=torch.bfloat16):
                 logits, loss = model(x, y)
             # we have to scale the loss to account for gradient accumulation,
@@ -86,9 +81,7 @@ def train(
             # instead of a SUM we want MEAN. Scale the loss here so it comes out right
             loss = loss / train_config.grad_accum_steps
             loss_accum += loss.detach()
-            timer('backward')
             loss.backward()
-        timer('optimizer start')
         if train_config.ddp:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -97,7 +90,6 @@ def train(
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
         optimizer.step()
-        timer('logging')
         if train_config.device == "cuda":
             torch.cuda.synchronize()  # wait for the GPU to finish work
         t1 = time.time()

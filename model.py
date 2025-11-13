@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from config import PicoGPTConfig, GPTConfig
 from torch.nn.parallel import DistributedDataParallel as DDP
 import inspect
+import transformer_engine.pytorch as te
+from transformer_engine.common import recipe
 
 class CausalSelfAttention(nn.Module):
 
@@ -11,9 +13,9 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_attn = te.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj = te.Linear(config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
@@ -41,9 +43,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.c_fc = te.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate="tanh")
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj =te.Linear(4 * config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
@@ -77,7 +79,7 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd, device=config.device),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = te.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # weight sharing
         self.transformer.wte.weight = self.lm_head.weight
@@ -121,25 +123,35 @@ class GPT(nn.Module):
         return optimizer
 
     def forward(self, idx, targets=None):
-        # idx is of shape (B, T)
-        B, T = idx.size()
-        assert T <= self.config.sequence_length, f"Cannot forward, model block size({T}) is exhausted."
-        # forward the token and position embeddings
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T,)
-        pos_emb = self.transformer.wpe(pos) # (T, n_embd)
-        tok_emb = self.transformer.wte(idx) # (B, T, n_embd)
-        x = tok_emb + pos_emb # (B, T, n_embd)
-        # forward the blocks of the transformer
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x) # (B, T, n_embd)
-        logits = self.lm_head(x) # (B, T, vocab_size)
+
+        # Create the fp8 recipe (E4M3 is common for training)
+        fp8_recipe = recipe.DelayedScaling(
+            margin=0,
+            interval=1, # calibrate scales every 1 iteration
+            fp8_format=recipe.Format.E4M3,
+        )
+
+        # use fp8_autocast to enable FP8 for all TE layers
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            # idx is of shape (B, T)
+            B, T = idx.size()
+            assert T <= self.config.sequence_length, f"Cannot forward, model block size({T}) is exhausted."
+
+
+            # forward the token and position embeddings
+            pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T,)
+            pos_emb = self.transformer.wpe(pos) # (T, n_embd)
+            tok_emb = self.transformer.wte(idx) # (B, T, n_embd)
+            x = tok_emb + pos_emb # (B, T, n_embd)
+            # forward the blocks of the transformer
+            for block in self.transformer.h:
+                x = block(x)
+            x = self.transformer.ln_f(x) # (B, T, n_embd)
+            logits = self.lm_head(x) # (B, T, vocab_size)
+        
+        # loss calculation remains in higher precision
         loss = None
         if targets is not None:
-            # token_id = targets[:, -1].unsqueeze(1)
-            # b = torch.zeros(B, self.config.vocab_size, dtype=torch.long, device=idx.device)
-            # b.scatter_(1, token_id, 1)
-            # loss = F.cross_entropy(logits, b)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 

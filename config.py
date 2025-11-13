@@ -86,7 +86,7 @@ class PicoGPTConfig:
     max_steps: int = 19073
     weight_decay: float = 0.01
 
-    batch_size: int = 32
+    batch_size: int = 16
 
     device: str = "cuda"
     ddp: bool = False
