@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
+from utils import create_timer
 # -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -378,7 +379,9 @@ log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
+timer = create_timer(True)
 for step in range(max_steps):
+    timer('start')
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
@@ -488,12 +491,15 @@ for step in range(max_steps):
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
+    timer(f'micro start - {grad_accum_steps}')
     for micro_step in range(grad_accum_steps):
+        timer('next batch')
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         # added after video, this field is also used by the forward pass.
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+        timer('forward')
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
@@ -502,15 +508,18 @@ for step in range(max_steps):
         # instead of a SUM we want MEAN. Scale the loss here so it comes out right
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
+        timer('backward')
         loss.backward()
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determine and set the learning rate for this iteration
+    timer('optimizer start')
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
+    timer('logging')
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
     t1 = time.time()

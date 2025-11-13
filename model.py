@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from config import GPTConfig
-
+from config import PicoGPTConfig, GPTConfig
+from torch.nn.parallel import DistributedDataParallel as DDP
+import inspect
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: PicoGPTConfig):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
@@ -72,7 +73,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd, device=config.device),
-            wpe = nn.Embedding(config.block_size, config.n_embd, device=config.device),
+            wpe = nn.Embedding(config.sequence_length, config.n_embd, device=config.device),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd, device=config.device),
         ))
@@ -114,7 +115,7 @@ class GPT(nn.Module):
         print(f"num no decay params: {len(no_decay_params)}, {num_no_decay_params:,} params")
         # Create AdamW optimizer and use the fused version if available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and 'cuda' in device
+        use_fused = fused_available and device.startswith("cuda")
         print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
         return optimizer
@@ -122,7 +123,7 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
         B, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward, model block size({T}) is exhausted."
+        assert T <= self.config.sequence_length, f"Cannot forward, model block size({T}) is exhausted."
         # forward the token and position embeddings
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T,)
         pos_emb = self.transformer.wpe(pos) # (T, n_embd)
@@ -199,3 +200,16 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+
+def load_model(config:PicoGPTConfig):
+    model = GPT(config)
+    model.to(config.device)
+    use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+    if use_compile:
+        model = torch.compile(model)
+    if config.ddp:
+        model = DDP(model, device_ids=[config.process_rank])
+    raw_model = model.module if config.ddp else model # always contains the "raw" unwrapped model
+    return model, raw_model
+
+    # write down the different with rank and local_rank on Notion

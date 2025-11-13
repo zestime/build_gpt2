@@ -7,8 +7,14 @@ requires-python = ">=3.9"
 dependencies = [
     "datasets>=4.4.1",
     "matplotlib>=3.9.4",
+    "pydantic>=2.12.4",
     "tiktoken>=0.12.0",
     "torch>=2.8.0",
     "transformers>=4.57.1",
     "urllib3>=2.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "watchdog>=6.0.0",
 ]
