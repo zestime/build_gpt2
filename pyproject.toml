@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools", "wheel", "torch>=2.8.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "build-gpt2"
 version = "0.1.0"
@@ -12,9 +16,16 @@ dependencies = [
     "torch>=2.8.0",
     "transformers>=4.57.1",
     "urllib3>=2.5.0",
+    "einops>=0.8.0",
+    "accelerate>=1.10.1",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
 
 [dependency-groups]
 dev = [
     "watchdog>=6.0.0",
+    "pytest>=8.2.2",
+    "pytest-mock>=3.14.0",
 ]
