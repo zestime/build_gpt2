@@ -1,5 +1,4 @@
 from functools import cached_property
-from pydantic import BaseModel
 from utils import make_execution_id
 from typing import Any, Type
 from dataclasses import dataclass, is_dataclass, fields
@@ -14,8 +13,7 @@ def is_namedtuple_type(cls: Type[Any]) -> bool:
     return issubclass(cls, tuple) and hasattr(cls, "_fields")
 
 
-def from_dict(cls, data):
-    print(data)
+def from_dict(cls, data, override=None):
     if is_namedtuple_type(cls):
         valid_fields = cls._fields
     elif is_dataclass(cls):
@@ -26,6 +24,8 @@ def from_dict(cls, data):
     data_dict = data
     if is_dataclass(data):
         data_dict = dataclasses.asdict(data)
+    if override:
+        data_dict.update(override)
     filtered_data = {k: v for k, v in data_dict.items() if k in valid_fields}
     return cls(**filtered_data)
 
@@ -49,6 +49,10 @@ class TrainConfig(ModelConfig):
     ddp: bool = False
     ddp_rank: int = 0
     ddp_world_size: int = 1
+
+    eval_interval: int = 50
+    infer_interval: int = 50
+    checkpoint_interval: int = 100
 
     @cached_property
     def grad_accum_steps(self) -> bool:
@@ -76,6 +80,7 @@ class PicoGPTConfig:
     sequence_length: int = 1024
     vocab_size: int = 50304  # 50,000 BPE merges + 256 bytes tokens + 1
     n_layer: int = 12  # number of layers
+    n_attn:int = 8
     n_head: int = 12
     n_kv_head: int = 2 # number of key-value heads
     n_embd: int = 768
@@ -100,16 +105,12 @@ class PicoGPTConfig:
     save_checkpoint: int = 1000
     save_optimizer: bool = True
 
-
-class OptimizerConfig(BaseModel):
-    max_learning_rate: float = 6e-4
-    min_learning_rate: float = max_learning_rate * 0.1
-    warmup_steps: int = 715
-    max_steps: int = 19073
-    weight_decay: float = 0.01
-    save_checkpoint: int = 1000
-    save_optimizer: bool = True
-
+preset = {
+    "test": {
+        "max_steps": 1000,
+        "batch_size": 16
+    }
+}
 
 def get_config(**args) -> PicoGPTConfig:
     execution_id = make_execution_id()
@@ -121,12 +122,15 @@ def get_config(**args) -> PicoGPTConfig:
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = "mps"
 
-    default_config = {
-        "execution_id": execution_id, "device": device
+    override_config = {
+        "execution_id": execution_id, 
+        "device": device
     }
 
-    data = args | default_config
+    if args.get("preset") == "test":
+        override_config.update(preset["test"])
 
     return from_dict(
-        PicoGPTConfig, data
+        PicoGPTConfig, override_config, args
     )
+

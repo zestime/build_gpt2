@@ -12,3 +12,11 @@ Then, you can run the tests using `pytest`:
 ```bash
 pytest
 ```
+
+
+## TODO
+
+- config
+- eval and infer
+- RoPE
+- MLA

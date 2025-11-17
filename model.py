@@ -62,15 +62,19 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, index):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
+        self.attention_layer = index < config.n_attn
+        
+        if self.attention_layer:
+            self.ln_1 = nn.LayerNorm(config.n_embd)
+            self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x)) # residual connection, pre-normalization version. reduce
+        if self.attention_layer:
+            x = x + self.attn(self.ln_1(x)) # residual connection, pre-normalization version. reduce
         x = x + self.mlp(self.ln_2(x)) # map
         return x
 
@@ -83,7 +87,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd, device=config.device),
             wpe = nn.Embedding(config.sequence_length, config.n_embd, device=config.device),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd, device=config.device),
         ))
         self.lm_head = te.Linear(config.n_embd, config.vocab_size, bias=False)

@@ -1,12 +1,15 @@
 import time
 import logging
 import argparse
+
+import tiktoken
 from config import get_config, PicoGPTConfig, TrainConfig, from_dict
 from dataset import DataLoaderLite
 from model import load_model
 import torch
 import torch.distributed as dist
 import math
+from torch.nn import functional as F
 
 def get_logger():
     logging.basicConfig(
@@ -51,22 +54,92 @@ def get_lr(it):
     )  # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
 
+def eval(model, val_loader, train_config:TrainConfig):
+    model.eval()
+    val_loader.reset()
+    with torch.no_grad():
+        val_loss_accum = 0.0
+        val_loss_steps = 20
+        for _ in range(val_loss_steps):
+            x, y = val_loader.next_batch()
+            x, y = x.to(train_config.device), y.to(train_config.device)
+            with torch.autocast(device_type=train_config.device, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+            loss = loss / val_loss_steps
+            val_loss_accum += loss.detach()
+    if train_config.ddp:
+        dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+    if train_config.ddp_master:
+        log.info(f"validation loss: {val_loss_accum.item():.4f}")
+
+def inference(model, tokenizer, train_config:TrainConfig):
+    model.eval()
+    num_return_sequences = 8
+    max_length = 32
+    tokens = tokenizer.encode("Hello, I am a language model,")
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+    xgen = tokens.to(train_config.device)
+    sample_rng = torch.Generator(device=train_config.device)
+    sample_rng.manual_seed(42 + train_config.ddp_rank)
+    while xgen.size(1) < max_length:
+        # forward the model to get the logits
+        with torch.no_grad():
+            with torch.autocast(device_type=train_config.device, dtype=torch.bfloat16):
+                logits, loss = model(xgen) # (B, T, vocab_size)
+            # take the logits at the last position
+            logits = logits[:, -1, :] # (B, vocab_size)
+            # get the probabilities
+            probs = F.softmax(logits, dim=-1)
+            # do top-k sampling of 50 (huggingface pipeline default)
+            # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+            # select a token from the top-k probabilities
+            # note: multinomial does not demand the input to sum to 1
+            ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+            # gather the corresponding indices
+            xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+            # append to the sequence
+            xgen = torch.cat((xgen, xcol), dim=1)
+    # print the generated text
+    for i in range(num_return_sequences):
+        tokens = xgen[i, :max_length].tolist()
+        decoded = tokenizer.decode(tokens)
+        print(f"rank {train_config.ddp_rank} sample {i}: {decoded}")
+    
+
 def train(
+    tokenizer,
     model,
     optimizer,
     lr_scheduler,
-    dataloader,
+    train_loader,
+    val_loader,
     train_config:TrainConfig
 ):
     for step in range(train_config.max_steps):
-        t0 = time.time()
         last_step = step == train_config.max_steps - 1
 
+        if step % train_config.eval_interval == 0:
+            eval(
+                model,
+                val_loader,
+                train_config
+            )
+
+        if step % train_config.infer_interval == 0:
+            inference(
+                model,
+                tokenizer,
+                train_config
+            )
+
+        t0 = time.time()
         model.train()
         optimizer.zero_grad()
         loss_accum = 0.0
         for micro_step in range(train_config.grad_accum_steps):
-            x, y = dataloader.next_batch()
+            x, y = train_loader.next_batch()
             x, y = x.to(train_config.device), y.to(train_config.device)
             # added after video, this field is also used by the forward pass.
             if train_config.ddp:
@@ -93,7 +166,7 @@ def train(
         t1 = time.time()
         dt = t1 - t0  # time difference in seconds
         tokens_processed = (
-            dataloader.B * dataloader.T 
+            train_loader.B * train_loader.T 
             * train_config.grad_accum_steps 
             * train_config.ddp_world_size
         )
@@ -111,6 +184,8 @@ def run(**args):
     # logger setting
     append_file_handler(log, config)
     log.info(f"update logger args: {args}")
+
+    tokenizer = tiktoken.get_encoding("gpt2")
 
     # load dataset
     train_loader = DataLoaderLite(
@@ -137,13 +212,16 @@ def run(**args):
         weight_decay=0.1, learning_rate=6e-4, device=config.device
     )
 
+
     # run train (always with validation)
     train_config = from_dict(TrainConfig, config)
     train(
+        tokenizer,
         model,
         optimizer,
         get_lr,
         train_loader,
+        val_loader,
         train_config
     )
 
@@ -154,7 +232,7 @@ if __name__ == "__main__":
 
     model_group = parser.add_argument_group("Model")
     model_group.add_argument(
-        "-p", "--preset", type=str, default="gpt2", help="gpt2,gpt2-xl"
+        "-p", "--preset", type=str, default="test", help="test,gpt2,gpt2-xl"
     )
 
     train_group = parser.add_argument_group("Train")
@@ -162,10 +240,7 @@ if __name__ == "__main__":
         "-d", "--device", type=str, default=None, help="gpt2,gpt2-xl"
     )
 
-    # parser.add_argument("-lr", "--learning_rate", type=float)
-    # parser.add_argument("--max_iters", type=int, default=1000)
-    # parser.add_argument("--device", type=str, default="cuda")
-
+    train_group.add_argument("--max_steps", type=int, default=None)
 
     opt = parser.parse_args()
     arg_dict = vars(opt)
