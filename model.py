@@ -7,6 +7,43 @@ import inspect
 import transformer_engine.pytorch as te
 from transformer_engine.common import recipe
 
+class RoPE(nn.Module):
+    def __init__(self, head_dim:int, max_seq_len:int = 2048, base: int=10000):
+        super().__init__()
+        # the rotation frequencies are precomputed and fixed
+        # 1. Calculate the inverse frequencies (theta_i in the formula)
+        # This creates the vector [1/base^(0/d), 1/base^(2/d), 1/base^(4/d), ...]
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+        # 2. Precompute the rotation angles (m * theta_i) for max sequence length
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq) # shape (max_seq_len, head_dim//2)
+
+        # 3. Convert to complex numbers for rotation (cos + i*sin)
+        self.register_buffer("freqs_cis", torch.polar(torch.ones_like(freqs), freqs))
+
+    def forward(self, x):
+        # x is assumed to be the Q or K tensor, shape(B, H, S, D)
+
+        # Use only the frequencies needed for the current sequence length
+        seq_len = x.size(-2)
+        freqs_cis = self.freqs_cis[:seq_len]
+        
+        # 1. Split the last dimension into pairs and view as complex numbers
+        # (B, H , S, D) -> (B , H, S, D/2, 2) -> (B, H, S, D/2) (complex)
+        x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+
+        # 2. Apply the rotaiton via complex multiplication
+        # Broadcasts freqs_cis (S, D/2) across Batch and Head dimensions
+        x_rotated = x_complex * freqs_cis.unsqueeze(0).unsqueeze(0)
+
+        # 3. Convert back to real tensor and flatten
+        # (B, H, S, D/2) (complex) -> (B, H, S, D/2, 2) (real) -> (B, H, S, D)
+        x_out = torch.view_as_real(x_rotated).flatten(3)
+
+        return x_out.type_as(x)
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config: PicoGPTConfig):
@@ -19,6 +56,8 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.head_size = config.n_embd // config.n_head
         self.n_kv_embd = config.n_kv_head * self.head_size
+
+        self.rope = RoPE(self.head_size, max_seq_len=config.context_length)
 
         # query + key + value projections for all heads, but in a batch
         total_projection_dim = self.n_embd + self.n_kv_embd * 2
@@ -38,6 +77,9 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_kv_head, self.head_size).transpose(1, 2)  # (B, T, nh, hs) -> (B, nh, T, hs)
         v = v.view(B, T, self.n_kv_head, self.head_size).transpose(1, 2)
         q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)
+
+        q = self.rope(q)
+        k = self.rope(k)
 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True) # (B, nh, T, hs)
 
