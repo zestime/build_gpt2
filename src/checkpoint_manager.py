@@ -4,7 +4,7 @@ import glob
 from pathlib import Path
 from typing import Optional, Dict, Any
 import shutil
-from logging import get_logger
+from src.utils.logging import get_logger
 
 log = get_logger()
 
@@ -15,7 +15,7 @@ class CheckPointManager:
         checkpoint_dir: str,
         metric_name: str,
         max_to_keep: int = 5,
-        mode: 'max' | 'min' = 'min'
+        mode: str = 'min'
     ):
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -51,7 +51,4 @@ class CheckPointManager:
         checkpoint_path = self.checkpoint_dir / f"checkpoint-{step}.pth"
         torch.save(checkpoint, checkpoint_path)
         log.info(f"Saved checkpoint to {checkpoint_path}")
-        
-
-        
         

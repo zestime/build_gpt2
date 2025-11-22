@@ -57,7 +57,11 @@ class CausalSelfAttention(nn.Module):
         self.head_size = config.n_embd // config.n_head
         self.n_kv_embd = config.n_kv_head * self.head_size
 
-        self.rope = RoPE(self.head_size, max_seq_len=config.context_length)
+        if config.rope:
+            self.rope = RoPE(self.head_size, max_seq_len=config.sequence_length)
+            self.preprocess = lambda x: self.rope(x)
+        else:
+            self.preprocess = lambda x: x
 
         # query + key + value projections for all heads, but in a batch
         total_projection_dim = self.n_embd + self.n_kv_embd * 2
@@ -78,8 +82,8 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_kv_head, self.head_size).transpose(1, 2)
         q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)
 
-        q = self.rope(q)
-        k = self.rope(k)
+        q = self.preprocess(q)
+        k = self.preprocess(k)
 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True) # (B, nh, T, hs)
 
@@ -122,16 +126,19 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config:PicoGPTConfig):
         super().__init__()
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd, device=config.device),
-            wpe = nn.Embedding(config.sequence_length, config.n_embd, device=config.device),
             h = nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd, device=config.device),
         ))
+
+        if config.ape:
+            self.transformer.add_module("wpe", nn.Embedding(config.sequence_length, config.n_embd, device=config.device))
+
         self.lm_head = te.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # weight sharing
@@ -190,12 +197,13 @@ class GPT(nn.Module):
             B, T = idx.size()
             assert T <= self.config.sequence_length, f"Cannot forward, model block size({T}) is exhausted."
 
-
             # forward the token and position embeddings
-            pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T,)
-            pos_emb = self.transformer.wpe(pos) # (T, n_embd)
-            tok_emb = self.transformer.wte(idx) # (B, T, n_embd)
-            x = tok_emb + pos_emb # (B, T, n_embd)
+            x = self.transformer.wte(idx) # (B, T, n_embd)
+            if self.config.ape:
+                pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T,)
+                pos_emb = self.transformer.wpe(pos) # (T, n_embd)
+                x = x + pos_emb
+
             # forward the blocks of the transformer
             for block in self.transformer.h:
                 x = block(x)

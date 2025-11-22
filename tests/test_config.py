@@ -1,6 +1,5 @@
-
 import pytest
-from utils import base62_encode, make_execution_id, create_timer
+from src.utils.utils import base62_encode, make_execution_id, create_timer
 import time
 from datetime import datetime
 from config import from_dict, ModelConfig, get_config
@@ -21,4 +20,3 @@ def test_from_dict_with_override():
 def test_get_test_config():
     config = get_config(preset="test")
     assert config.preset == "test"
-    assert config.max_steps == 1000

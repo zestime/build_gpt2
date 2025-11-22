@@ -1,5 +1,5 @@
 from functools import cached_property
-from utils import make_execution_id
+from src.utils.utils import make_execution_id
 from typing import Any, Type
 from dataclasses import dataclass, is_dataclass, fields
 import dataclasses
@@ -29,6 +29,9 @@ def from_dict(cls, data, override=None):
     filtered_data = {k: v for k, v in data_dict.items() if k in valid_fields}
     return cls(**filtered_data)
 
+@dataclass
+class ExecutionConfig:
+    execution_id: str 
 
 @dataclass
 class ModelConfig:
@@ -42,7 +45,7 @@ class ModelConfig:
     
 
 @dataclass
-class TrainConfig(ModelConfig):
+class TrainConfig(ModelConfig, ExecutionConfig):
     max_steps: int = 0
     device: str = 'cpu'
     compile: bool = True
@@ -50,9 +53,20 @@ class TrainConfig(ModelConfig):
     ddp_rank: int = 0
     ddp_world_size: int = 1
 
-    eval_interval: int = 50
-    infer_interval: int = 50
-    checkpoint_interval: int = 100
+
+    rope:bool = False
+    ape:bool = True
+
+    infer_interval: int = 1000
+    eval_interval: int = 1000
+    checkpoint_interval: int = 0
+    checkpoint_dir: str = "checkpoints"
+    metric_name: str = "loss"
+    max_to_keep: int = 5
+    mode: str = 'min'
+
+    save_log: bool = True
+    logging_dir_prefix: str = "log"
 
     @cached_property
     def grad_accum_steps(self) -> bool:
@@ -61,6 +75,14 @@ class TrainConfig(ModelConfig):
     @cached_property
     def ddp_master(self) -> bool:
         return self.ddp_rank == 0
+
+    @cached_property
+    def infer_enable(self) -> bool:
+        return self.infer_interval > 0
+
+    @cached_property
+    def eval_enable(self) -> bool:
+        return self.eval_interval > 0
 
 
 @dataclass
@@ -73,8 +95,7 @@ class GPTConfig:
 
 
 @dataclass
-class PicoGPTConfig:
-    execution_id: str
+class PicoGPTConfig(TrainConfig):
     preset: str = "gpt2"
 
     sequence_length: int = 1024
@@ -100,15 +121,19 @@ class PicoGPTConfig:
     local_rank: int = 0
     num_processes: int = 1
 
-    save_log: bool = True
-    logging_dir_prefix: str = "log"
-    save_checkpoint: int = 1000
-    save_optimizer: bool = True
-
-preset = {
+defined_presets = {
     "test": {
-        "max_steps": 1000,
+        "max_steps": 3000, # 1.5B tokens
+        "warmup_steps": 500,
+        "infer_interval": 0,
+        "eval_interval": 300,
         "batch_size": 16
+    },
+    "debug": {
+        "max_steps": 10,
+        "infer_interval": 0,
+        "eval_interval": 0,
+        "checkpoint_interval": 0
     }
 }
 
@@ -127,8 +152,9 @@ def get_config(**args) -> PicoGPTConfig:
         "device": device
     }
 
-    if args.get("preset") == "test":
-        override_config.update(preset["test"])
+    preset = args.get("preset")
+    if preset in defined_presets:
+        override_config.update(defined_presets[preset])
 
     return from_dict(
         PicoGPTConfig, override_config, args

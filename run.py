@@ -2,6 +2,7 @@ import time
 import logging
 import argparse
 
+from src.checkpoint_manager import CheckPointManager
 import tiktoken
 from config import get_config, PicoGPTConfig, TrainConfig, from_dict
 from dataset import DataLoaderLite
@@ -10,6 +11,7 @@ import torch
 import torch.distributed as dist
 import math
 from torch.nn import functional as F
+from pathlib import Path
 
 def get_logger():
     logging.basicConfig(
@@ -25,34 +27,35 @@ log = get_logger()
 
 def append_file_handler(logger, config: PicoGPTConfig):
     if config.save_log:
-        filename = f"{config.logging_dir_prefix}/log-{config.execution_id}.log"
+        logging_dir = Path(f"{config.logging_dir_prefix}/{config.execution_id}")
+        logging_dir.mkdir(parents=True, exist_ok=True)
+        filename = logging_dir / "train.log"
         file_handler = logging.FileHandler(filename, "w")
         file_handler.setLevel(logging.INFO)
         logger.addHandler(file_handler)
         log.info(f"append file handler: {filename}")
 
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
-# for testing
-warmup_iters = 20 # warm up 375e6 tokens, 375e6 / 0.5B(one epoch) = 715
-max_steps = 1000 # if train 10e9, 10e9 / 2**19(one epoch) = 200000
+def create_lr_scheduler(config:PicoGPTConfig):
+    max_lr = config.max_learning_rate
+    min_lr = config.min_learning_rate
+    warmup_steps = config.warmup_steps
+    max_steps = config.max_steps
 
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_steps:
-        return max_lr * (it + 1) / warmup_steps
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > max_steps:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (
-        1.0 + math.cos(math.pi * decay_ratio)
-    )  # coeff starts at 1 and goes to 0
-    return min_lr + coeff * (max_lr - min_lr)
+    def get_lr(it):
+        # 1) linear warmup for warmup_iters steps
+        if it < warmup_steps:
+            return max_lr * (it + 1) / warmup_steps
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > max_steps:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (
+            1.0 + math.cos(math.pi * decay_ratio)
+        )  # coeff starts at 1 and goes to 0
+        return min_lr + coeff * (max_lr - min_lr)
+    return get_lr
 
 def eval(model, val_loader, train_config:TrainConfig):
     model.eval()
@@ -117,22 +120,30 @@ def train(
     val_loader,
     train_config:TrainConfig
 ):
-    for step in range(train_config.max_steps):
-        last_step = step == train_config.max_steps - 1
+    checkpoint_manager = CheckPointManager(
+        f"{train_config.logging_dir_prefix}/{train_config.execution_id}",
+        train_config.metric_name,
+        train_config.max_to_keep,
+        train_config.mode
+    )
 
-        if step % train_config.eval_interval == 0:
+    for step in range(1, train_config.max_steps + 1):
+        last_step = step == train_config.max_steps + 1
+
+        if train_config.eval_enable and step % train_config.eval_interval == 0:
             eval(
                 model,
                 val_loader,
                 train_config
             )
 
-        if step % train_config.infer_interval == 0:
+        if train_config.infer_enable and step % train_config.infer_interval == 0:
             inference(
                 model,
                 tokenizer,
                 train_config
             )
+
 
         t0 = time.time()
         model.train()
@@ -176,10 +187,25 @@ def train(
                 f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt * 1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
             )
 
+        if train_config.checkpoint_interval > 0 and (
+            step % train_config.checkpoint_interval == 0 or last_step
+        ):
+            checkpoint_manager.save_checkpoint(
+                step,
+                model,
+                optimizer,
+                metric_value=loss_accum.item(),
+                additional_info=None
+            )
+
 def run(**args):
     # load config with overrided values
     config = get_config(**args)
-    log.info(f"config : {config}")
+
+    if (config.preset == "debug"):
+        log.debug("debug mode")
+        log.debug(f"args: {args}")
+        log.info(f"config : {config}")
 
     # logger setting
     append_file_handler(log, config)
@@ -213,13 +239,17 @@ def run(**args):
     )
 
 
+    lr_scheduler = create_lr_scheduler(
+        config
+    )
+
     # run train (always with validation)
     train_config = from_dict(TrainConfig, config)
     train(
         tokenizer,
         model,
         optimizer,
-        get_lr,
+        lr_scheduler,
         train_loader,
         val_loader,
         train_config
@@ -232,12 +262,28 @@ if __name__ == "__main__":
 
     model_group = parser.add_argument_group("Model")
     model_group.add_argument(
-        "-p", "--preset", type=str, default="test", help="test,gpt2,gpt2-xl"
+        "-p", "--preset", type=str, default="test", help="debug,test,gpt2,gpt2-xl"
+    )
+
+    model_group.add_argument(
+        "-pos", "--position", type=str, default="ape", help="ape,rope"
     )
 
     train_group = parser.add_argument_group("Train")
     train_group.add_argument(
-        "-d", "--device", type=str, default=None, help="gpt2,gpt2-xl"
+        "-ei", "--infer_interval", type=int, default=None, help="500"
+    )
+    train_group.add_argument(
+        "-ev", "--eval_interval", type=int, default=None, help="1000"
+    )
+    train_group.add_argument(
+        "-d", "--device", type=str, default=None, help="cpu,cuda"
+    )
+    train_group.add_argument(
+        "--rope", action="store_true", help="use RoPE"
+    )
+    train_group.add_argument(
+        "--ape", action="store_true", help="use APE(absolute position encoding)"
     )
 
     train_group.add_argument("--max_steps", type=int, default=None)

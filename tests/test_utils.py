@@ -1,6 +1,6 @@
 
 import pytest
-from utils import base62_encode, make_execution_id, create_timer
+from src.utils.utils import base62_encode, make_execution_id, create_timer
 import time
 from datetime import datetime
 
@@ -9,8 +9,8 @@ def test_base62_encode():
     assert base62_encode(10) == "A"
     assert base62_encode(61) == "z"
     assert base62_encode(62) == "10"
-    assert base62_encode(12345) == "3d7"
-    assert base62_encode(12345, limit=2) == "d7"
+    assert base62_encode(12345) == "3D7"
+    assert base62_encode(12345, limit=2) == "D7"
 
 def test_make_execution_id():
     exec_id = make_execution_id()
