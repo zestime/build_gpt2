@@ -101,7 +101,7 @@ class PicoGPTConfig(TrainConfig):
     sequence_length: int = 1024
     vocab_size: int = 50304  # 50,000 BPE merges + 256 bytes tokens + 1
     n_layer: int = 12  # number of layers
-    n_attn:int = 8
+    # n_attn:int = 8
     n_head: int = 12
     n_kv_head: int = 2 # number of key-value heads
     n_embd: int = 768
@@ -127,13 +127,15 @@ defined_presets = {
         "warmup_steps": 500,
         "infer_interval": 0,
         "eval_interval": 300,
+        "checkpoint_interval": 1000,
         "batch_size": 16
     },
     "debug": {
         "max_steps": 10,
         "infer_interval": 0,
-        "eval_interval": 0,
-        "checkpoint_interval": 0
+        "eval_interval": 5,
+        "checkpoint_interval": 5,
+        "max_to_keep": 3
     }
 }
 

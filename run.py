@@ -201,15 +201,13 @@ def train(
 def run(**args):
     # load config with overrided values
     config = get_config(**args)
-
-    if (config.preset == "debug"):
-        log.debug("debug mode")
-        log.debug(f"args: {args}")
-        log.info(f"config : {config}")
-
     # logger setting
     append_file_handler(log, config)
     log.info(f"update logger args: {args}")
+    log.info(f"config : {config}")
+
+    if (config.preset == "debug"):
+        log.debug("debug mode")
 
     tokenizer = tiktoken.get_encoding("gpt2")
 
